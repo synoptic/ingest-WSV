@@ -1,66 +1,79 @@
-import csv
-import re
 import requests
-from io import StringIO
-from datetime import datetime, timedelta
-from ingestlib import aws
-import sys, os
-import ssl
-import certifi
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from enum import IntEnum
-import boto3
 import json
 import logging
 import time
-from ingestlib import station_lookup, parse, core
-import math
+import os
 import posixpath
-import re, unicodedata
+import math
+
+from ingestlib import aws, station_lookup, core
+
 ########################################################################################################################
 # OVERVIEW
 ########################################################################################################################
-
-# This script handles metadata processing for new data ingests. The goal is to get metadata into metamoth. Key considerations:
+# germanyWSV Metadata Ingest
 #
-# Metadata Sources:
-# - Provider metadata endpoint (preferred): Allows pre-compilation/validation of STIDs before observation ingestion
-# - Observation ingest script: Metadata extracted during observation processing
-#
-# STID Management:
-# - Critical to maintain unique STIDs
-# - Once created, STIDs must never be rewritten
-# - Careful handling required when creating STIDs during observation processing to avoid POE receiving STIDs that don't exist in metamoth.
-#
-# Process Flow:
-# 1. Define Constants (Elevation Unit, MNET ID, etc.)
-# 1. Collect raw metadata (source-dependent)
-# 2. Validate/ensure unique STIDs that DON'T get overwritten/edited
-# 3. Parse station details (lat, lon, elevation, other_id)
-# 4. Insert into database via:
-#    - Metamanager (preferred method)
-#    - Station lookup (backup method)
-#
-# Output:
-# - Creates SQL for metadata database insertion
-# - Updates stations_metadata.json
+# Features:
+# - Fetches station metadata from Pegelonline REST API
+# - Validates lat/lon
+# - Applies DWD exact match mapping
+# - Generates station lookup payload
+# - Saves metadata locally and uploads to S3
+# - Runs station_lookup.load_metamgr
+########################################################################################################################
 
 ########################################################################################################################
 # DEFINE CONSTANTS
 ########################################################################################################################
-INGEST_NAME = #TODO Update Ingest Name
+INGEST_NAME = "germanyWSV"
 M_TO_FEET = 3.28084
 ELEVATION_UNIT = 'METERS' # ELEVATION UNIT OF THIS INGESTS METADATA MUST BE EITHER 'METERS' OR 'FEET'. METAMOTH CURRENTLY STORES ELEVATION IN FEET, SO WE WILL CONVERT IF IT'S IN METERS. 
-MNET_ID = # CREATE NEW MNET_ID FOR THIS INGEST
-MNET_SHORTNAME = #TODO add the mnet shortname
-RESTRICTED_DATA_STATUS = False # True or False, IS THE DATA RESTRICTED?
-RESTRICTED_METADATA_STATUS = False # True or False, IS THE METADATA RESTRICTED?
-STID_PREFIX = #TODO add the stid prefix
+PEGELONLINE_BASE = "https://www.pegelonline.wsv.de/webservices/rest-api/v2"
+STATIONS_URL = f"{PEGELONLINE_BASE}/stations.json?includeTimeseries=true"
+MNET_ID = 343
+MNET_SHORTNAME = "WSV"
+RESTRICTED_DATA_STATUS = False
+RESTRICTED_METADATA_STATUS = False
+STID_PREFIX = "WSV"
 
 ########################################################################################################################
-# DEFINE LOGS
+# DWD EXACT MATCH MAP
+########################################################################################################################
+
+EXACT_MATCH_DWD_MAP = {
+    "CELLE": "DWD10343",
+    "KONSTANZ": "DWD10929",
+    "WITTENBERG": "DWD10474",
+    "BOIZENBURG": "DWD10249",
+    "HETLINGEN": "DWDR278",
+    "GENTHIN": "DWD10365",
+    "UELZEN": "DWDE475",
+    "PAPENBURG": "DWDR386",
+    "FRIEDRICHSTHAL": "DWDS701",
+    "RAUNHEIM": "DWDL829",
+    "BAMBERG": "DWD10675",
+    "RECKE": "DWDT123",
+    "BRAMSCHE": "DWDR519",
+    "LIST AUF SYLT": "DWD10020",
+    "BARTH": "DWD10180",
+    "STRALSUND": "DWDS050",
+    "WOLGAST": "DWDS189",
+    "KARLSHAGEN": "DWDB382",
+    "KIEL-HOLTENAU": "DWD10046",
+    "SCHLESWIG": "DWD10035",
+    "DEMMIN": "DWDS220",
+    "ANKLAM": "DWDB488",
+    "POTSDAM": "DWD10379",
+    "MANNHEIM": "DWD10729",
+    "WORMS": "DWDK699",
+    "ANDERNACH": "DWD10520",
+    "BRAKE": "DWDE235",
+    "PETERSHAGEN": "DWDH027",
+    "NIENBURG": "DWDE652",
+}
+
+########################################################################################################################
+# LOGGING
 ########################################################################################################################
 logger = logging.getLogger(f"{INGEST_NAME}_ingest")
 
@@ -84,7 +97,7 @@ def generate_metadata_payload(station_meta, payload_type, source_info=None):
         raise ValueError("Invalid payload_type. Must be 'station_lookup' or 'metamanager'.")
 
     metadata = []
-    
+
     for station_id, row in station_meta.items():
         try:
             # Extract required fields from the row
@@ -141,7 +154,7 @@ def generate_metadata_payload(station_meta, payload_type, source_info=None):
                 logger.debug(f"Skipping station {station_id} due to missing required fields: STID or NAME.")
         except ValueError as e:
             logger.debug(f"Skipping station {station_id} due to error: {e}")
-    
+
     if payload_type == "station_lookup":
         payload = {
             "MNET_ID": MNET_ID,
@@ -182,12 +195,71 @@ def save_to_json(data, filename):
         json.dump(data, f, indent=4)
 
 ########################################################################################################################
+# FETCH PEGELONLINE
+########################################################################################################################
+
+def fetch_pegelonline_stations():
+    logger.debug("Fetching Pegelonline stations")
+    response = requests.get(STATIONS_URL, timeout=60)
+    response.raise_for_status()
+    stations = response.json()
+    logger.debug(f"Fetched {len(stations)} stations")
+    return stations
+
+########################################################################################################################
+# PARSE STATIONS
+########################################################################################################################
+
+def build_station_meta(raw_stations):
+    station_meta = {}
+    for stn in raw_stations:
+        uuid = stn.get("uuid")
+        number = stn.get("number")
+        shortname = stn.get("shortname", "")
+        longname = stn.get("longname", shortname)
+        lat = stn.get("latitude")
+        lon = stn.get("longitude")
+        if not uuid or lat is None or lon is None:
+            continue
+        lat = float(lat)
+        lon = float(lon)
+        if lat == 0 and lon == 0:
+            continue
+        stid = f"{STID_PREFIX}{str(number).zfill(10)}"
+        short_upper = shortname.upper().strip()
+        other_id = EXACT_MATCH_DWD_MAP.get(short_upper, number)
+        station_meta[uuid] = {
+            "SYNOPTIC_STID": stid,
+            "NAME": longname,
+            "LAT": lat,
+            "LON": lon,
+            "OTID": other_id,
+            "RESTRICTED_DATA": RESTRICTED_DATA_STATUS,
+            "RESTRICTED_METADATA": RESTRICTED_METADATA_STATUS
+        }
+    logger.debug(f"Parsed {len(station_meta)} stations")
+    return station_meta
+
+def fetch_and_build_metadata():
+    """
+    Fetches raw station data and builds station metadata.
+    """
+    try:
+        raw_stations = fetch_pegelonline_stations()
+        station_meta = build_station_meta(raw_stations)
+        return station_meta
+    except Exception as e:
+        logger.exception("Error fetching or building station metadata")
+        raise
+
+########################################################################################################################
 # MAIN FUNCTION
 ########################################################################################################################
-def main(event,context):
+def main(event, context):
     from args import args
 
-    # ----- choose dirs once -----
+    # Directories
+    work_dir = log_dir = s3_work_dir = None
     if args.local_run or args.dev:
         log_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../dev"))
         work_dir = "../dev/"
@@ -196,8 +268,9 @@ def main(event,context):
         log_dir = "/tmp/tmp/"
         work_dir = "/tmp/tmp/"
         s3_work_dir = "metadata/"
+    os.makedirs(work_dir, exist_ok=True)
 
-    # ----- logging (stdout + one file) -----
+    # Logging
     log_file = core.setup_logging(
         logger, INGEST_NAME,
         log_level=getattr(args, "log_level", "INFO"),
@@ -205,136 +278,75 @@ def main(event,context):
         log_dir=log_dir,
         filename=f"{INGEST_NAME}_meta.log"
     )
-
     core.setup_signal_handler(logger, args)
-
-    logger.debug(f"ARGS LOADED from: {__file__}")
-    logger.debug(f"ENV at load time: DEV={os.getenv('DEV')} LOCAL_RUN={os.getenv('LOCAL_RUN')} LOG_LEVEL={os.getenv('LOG_LEVEL')}")
     logger.debug(vars(args))
-    
     start_runtime = time.time()
+
     try:
-        # Declare S3 Paths for Metadata Storage
+        # S3 config
         s3_bucket_name = os.environ.get('INTERNAL_BUCKET_NAME')
         if not s3_bucket_name:
             raise ValueError("Missing INTERNAL_BUCKET_NAME env var.")
-
-        s3_meta_work_dir = "metadata"
-        s3_station_meta_file = posixpath.join(s3_meta_work_dir, f"{INGEST_NAME}_stations_metadata.json")
-
-        # Declare Local Paths
-        work_dir = '/tmp/tmp/'
-        os.makedirs(work_dir, exist_ok=True)
+        s3_station_meta_file = posixpath.join(s3_work_dir, f"{INGEST_NAME}_stations_metadata.json")
         station_meta_file = os.path.join(work_dir, f"{INGEST_NAME}_stations_metadata.json")
 
-        # Load Existing Stations and Payload Files
+        # Load existing stations
+        existing_stations = {}
         try:
             aws.S3.download_file(bucket=s3_bucket_name, object_key=s3_station_meta_file, local_directory=work_dir)
-            with open(station_meta_file, 'r', encoding='utf-8') as json_file:
-                existing_stations = json.load(json_file)
-            logger.info(f"Loaded {len(existing_stations)} existing stations")
+            with open(station_meta_file, 'r') as f:
+                existing_stations = json.load(f)
+            logger.debug(f"Loaded {len(existing_stations)} existing stations")
         except FileNotFoundError:
-            logger.info("No existing station metadata found")
+            logger.debug("No existing station metadata found")
         except Exception as e:
             logger.warning(f"Failed to load existing station metadata: {e}")
-        ########################################################################################################################
-        # Fetch Metadata
-        ########################################################################################################################
-        # --------------- 2. RAW METADATA COLLECTION (if not collected already by obs lambda) ---------------
-        # Fetch initial metadata as raw_meta variable, ideally this is from a metadata specific endpoint, although it's possible this doesn't exist...
-        
-        raw_data = #TODO fetch the raw metadata if apt
-        # --------------- 3. METADATA PROCESSING ---------------
-        station_meta = #TODO parse the raw data to something that generate_metadata_payload() can process
 
-        # --------------- 4. STATION LOOKUP PAYLOAD CREATION ---------------
-        station_lookup_payload = generate_metadata_payload(station_meta=station_meta, payload_type='station_lookup')
+        # Fetch stations
+        station_meta = fetch_and_build_metadata()
 
-        # SAVE TO LOCAL DEV (if local_run)
+        # Save locally in dev
         if args.local_run:
-            dev_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../dev'))
+            dev_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../dev"))
             os.makedirs(dev_dir, exist_ok=True)
-
-            # Save station_meta locally
-            station_meta_dev_path = os.path.join(dev_dir, f'{INGEST_NAME}_stations_metadata.json')
-            with open(station_meta_dev_path, 'w') as f:
-                json.dump(station_meta, f, indent=4)
-
-            # Save station_lookup_payload locally
-            lookup_payload_dev_path = os.path.join(dev_dir, f'{INGEST_NAME}_station_lookup_payload.json')
-            with open(lookup_payload_dev_path, 'w') as f:
-                json.dump(station_lookup_payload, f, indent=4)
-
-            logger.debug(f"[DEV] Saved station_meta to {station_meta_dev_path}")
-            logger.debug(f"[DEV] Saved station_lookup_payload to {lookup_payload_dev_path}")
+            dev_path = os.path.join(dev_dir, f"{INGEST_NAME}_stations_metadata.json")
+            save_to_json(station_meta, dev_path)
+            logger.debug(f"[DEV] Saved station_meta to {dev_path}")
             logger.debug(f"[DEV] Station count: {len(station_meta)}")
 
+        # Station lookup payload
+        station_lookup_payload = generate_metadata_payload(station_meta, payload_type='station_lookup')
+
+        # Production: station lookup + S3 upload
         if not args.local_run:
+            logger.debug("Running station lookup in production mode")
             try:
-                logger.debug('production station lookup proceeding')
-                station_lookup.load_metamgr(station_lookup_payload, logstream=logger, mode='prod', output_location=work_dir)
-                logger.debug('past station lookup')
+                station_lookup.load_metamgr(station_lookup_payload, mode='prod', logstream=logger, output_location=work_dir)
+                logger.debug("Station lookup completed successfully")
             except Exception as e:
                 logger.exception(f"Station lookup failed: {e}")
                 raise
 
-            # --------------- 5. DATA PERSISTENCE ---------------
+            # Upload metadata
+            save_to_json(station_meta, station_meta_file)
+            aws.S3.upload_file(local_file_path=station_meta_file, bucket=s3_bucket_name, s3_key=s3_station_meta_file)
+            logger.debug(f"Saved {len(station_meta)} stations to {s3_station_meta_file}")
 
-            # Save and upload station_meta
-            save_to_json(data=station_meta, filename=station_meta_file)
-            aws.S3.upload_file(
-                local_file_path=station_meta_file,
-                bucket=s3_bucket_name,
-                s3_key=s3_station_meta_file
-            )
+            # Cleanup old SQL files
+            deleted_count = aws.S3.delete_files(bucket=s3_bucket_name, prefix=s3_work_dir, endswith=".sql")
+            logger.debug(f"Deleted {deleted_count} SQL files from {s3_bucket_name}")
+            for f in os.listdir(work_dir):
+                if f.endswith(".sql"):
+                    s3_key = f"{s3_work_dir}/{f}"
+                    aws.S3.upload_file(local_file_path=os.path.join(work_dir, f), bucket=s3_bucket_name, s3_key=s3_key)
 
-            # Save and upload station_lookup_payload
-            station_lookup_file = os.path.join(work_dir, f'{INGEST_NAME}_station_lookup_payload.json')
-            save_to_json(data=station_lookup_payload, filename=station_lookup_file)
-            s3_lookup_key = os.path.join(s3_meta_work_dir, f'{INGEST_NAME}_station_lookup_payload.json')
-            aws.S3.upload_file(
-                local_file_path=station_lookup_file,
-                bucket=s3_bucket_name,
-                s3_key=s3_lookup_key
-            )
+        logger.info(json.dumps({"completion": 1, "time": time.time() - start_runtime}))
 
-            # Clean up old SQL files
-            deleted_files_count = aws.S3.delete_files(
-                bucket=s3_bucket_name,
-                prefix=s3_meta_work_dir,
-                endswith=".sql"
-            )
-            logger.debug(f"Deleted {deleted_files_count} SQL files from the bucket {s3_bucket_name}")
-            for file_name in os.listdir(work_dir):
-                if file_name.endswith(".sql"):
-                    # Get the full path of the SQL file
-                    sql_updates = os.path.join(work_dir, file_name)
-                    
-                    # Get the path portion of the s3_key (without the file name)
-                    s3_key_path = os.path.dirname(s3_station_meta_file)
-                    
-                    # Manually join the S3 path and the new SQL file name
-                    s3_sql = f"{s3_key_path}/{os.path.basename(sql_updates)}"
-                    
-                    # Upload the SQL file to S3
-                    aws.S3.upload_file(local_file_path=sql_updates, 
-                                    bucket=s3_bucket_name, 
-                                    s3_key=s3_sql)
-
-        logger.info(msg=json.dumps({'completion': 1, 'time': time.time() - start_runtime}))
-        
     except Exception as e:
-        logger.error(msg=json.dumps({'completion': 0, 'time': time.time() - start_runtime}))
-        raise 
-        
+        logger.exception(f"Unhandled exception: {e}")
+        logger.error(json.dumps({"completion": 0, "time": time.time() - start_runtime}))
+
     finally:
         total_runtime = time.time() - start_runtime
-        logger.info(f"Total execution time: {total_runtime:.2f} seconds")
-
-
-        # 2) prod only: upload the *exact* file we just wrote
-        if (not args.local_run) and (not args.dev) and log_file and s3_bucket_name:
-            s3_log_key = posixpath.join(s3_work_dir, f"{INGEST_NAME}_meta.log")
-            aws.S3.upload_file(local_file_path=log_file, bucket=s3_bucket_name, s3_key=s3_log_key)
-        
+        logger.debug(f"Total execution time: {total_runtime:.2f} seconds")
         logging.shutdown()
