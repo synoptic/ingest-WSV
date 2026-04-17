@@ -1,13 +1,3 @@
-# variables = {
-#     "incoming variable name from data provider": {
-#         "vargem": "Synoptic Variable Table Vargem",
-#         "VNUM": "Synotic VNUM",
-#         "long_name": "Long name description",
-#         "incoming_unit": "incoming data unit from data provider",
-#         "final_unit": "final unit that POE is expecting (should be metric unit if keeping units in json slug)"
-#     }
-# }
-
 variables = {
     "W": {
         "vargem": "WLEV",
