@@ -1,11 +1,10 @@
 """
 Germany WSV metadata ingest
 
-Fetches station metadata from the Pegelonline REST API, applies DWD
-exact-match ID overrides where known, and registers all stations with
-station_lookup. Supports local mode.
+Fetches station metadata from the Pegelonline REST API and registers all
+stations with station_lookup. Supports local mode.
 
-~600+ river-gauge stations; DWD-matched stations get canonical DWD SYNOPTIC_STID.
+~600+ river-gauge stations; each gets its own sequential WSV STID.
 """
 
 import json
@@ -21,38 +20,6 @@ from config import NAME, MNET_ID, STID_PREFIX, INCOMING_ELEVATION_UNIT
 PEGELONLINE_BASE = "https://www.pegelonline.wsv.de/webservices/rest-api/v2"
 STATIONS_URL     = f"{PEGELONLINE_BASE}/stations.json?includeTimeseries=true"
 
-# ── DWD exact-match map ────────────────────────────────────────────
-EXACT_MATCH_DWD_MAP: dict[str, str] = {
-    "CELLE":            "DWD10343",
-    "KONSTANZ":         "DWD10929",
-    "WITTENBERG":       "DWD10474",
-    "BOIZENBURG":       "DWD10249",
-    "HETLINGEN":        "DWDR278",
-    "GENTHIN":          "DWD10365",
-    "UELZEN":           "DWDE475",
-    "PAPENBURG":        "DWDR386",
-    "FRIEDRICHSTHAL":   "DWDS701",
-    "RAUNHEIM":         "DWDL829",
-    "BAMBERG":          "DWD10675",
-    "RECKE":            "DWDT123",
-    "BRAMSCHE":         "DWDR519",
-    "LIST AUF SYLT":    "DWD10020",
-    "BARTH":            "DWD10180",
-    "STRALSUND":        "DWDS050",
-    "WOLGAST":          "DWDS189",
-    "KARLSHAGEN":       "DWDB382",
-    "KIEL-HOLTENAU":    "DWD10046",
-    "SCHLESWIG":        "DWD10035",
-    "DEMMIN":           "DWDS220",
-    "ANKLAM":           "DWDB488",
-    "POTSDAM":          "DWD10379",
-    "MANNHEIM":         "DWD10729",
-    "WORMS":            "DWDK699",
-    "ANDERNACH":        "DWD10520",
-    "BRAKE":            "DWDE235",
-    "PETERSHAGEN":      "DWDH027",
-    "NIENBURG":         "DWDE652",
-}
 
 class GermanyWSVMeta(MetadataIngest):
     NAME           = NAME
@@ -92,32 +59,32 @@ class GermanyWSVMeta(MetadataIngest):
 
     def parse(self, raw_stations: list) -> dict:
         """
-        Parse Pegelonline into station_meta with canonical DWD STIDs for overlaps.
+        Parse Pegelonline stations into station_meta. Every station receives
+        its own sequential WSV STID regardless of any overlap with other networks.
         """
         station_meta = dict(self.existing_stations)
         assigned_stids = {
-            s.get("SYNOPTIC_STID") 
-            for s in self.existing_stations.values() 
+            s.get("SYNOPTIC_STID")
+            for s in self.existing_stations.values()
             if s.get("SYNOPTIC_STID")
         }
         next_stid_seq = 1
-        
+
         counters = {
-            "accepted": 0, "skipped_no_uuid": 0, "skipped_bad_coords": 0, 
-            "dwd_matched": 0, "dwd_canonical": 0
+            "accepted": 0, "skipped_no_uuid": 0, "skipped_bad_coords": 0,
         }
 
         def _next_sequential_stid() -> str:
             nonlocal next_stid_seq
             while True:
-                candidate = f"{self.STID_PREFIX}{next_stid_seq}"
+                candidate = f"{self.STID_PREFIX}{next_stid_seq:04d}"
                 next_stid_seq += 1
                 if candidate not in assigned_stids:
                     return candidate
 
         for stn in raw_stations:
-            uuid     = stn.get("uuid")
-            number   = stn.get("number")
+            uuid      = stn.get("uuid")
+            number    = stn.get("number")
             shortname = stn.get("shortname", "")
             longname  = stn.get("longname") or shortname
             longname  = unicodedata.normalize("NFKD", longname).encode("ascii", "ignore").decode("ascii")
@@ -140,38 +107,22 @@ class GermanyWSVMeta(MetadataIngest):
             # Elevation (Pegelonline "km" = river-km, not elevation)
             elevation = None
 
-            # Canonical STID logic
-            short_upper = shortname.upper().strip()
-            dwd_id = EXACT_MATCH_DWD_MAP.get(short_upper)
-            
-            if dwd_id:
-                canonical_stid = dwd_id  # DWD10343 (canonical)
-                other_id = number        # Pegelonline source ID
-                counters["dwd_matched"] += 1
-                counters["dwd_canonical"] += 1
-                self.logger.debug(f"DWD canonical '{shortname}' → {canonical_stid}")
-            else:
-                canonical_stid = _next_sequential_stid()
-                other_id = number
-
-            # Ensure uniqueness
-            if canonical_stid not in assigned_stids:
-                assigned_stids.add(canonical_stid)
+            # Every WSV station gets its own sequential STID
+            canonical_stid = _next_sequential_stid()
+            assigned_stids.add(canonical_stid)
 
             station_meta[uuid] = {
-                "SYNOPTIC_STID": canonical_stid,  # Canonical (DWD for matches)
+                "SYNOPTIC_STID": canonical_stid,
                 "NAME":          longname,
                 "LATITUDE":      lat,
                 "LONGITUDE":     lon,
                 "ELEVATION":     elevation,
-                "OTHER_ID":      other_id,       # Source ID (Pegelonline number)
+                "OTHER_ID":      number,        # Source ID (Pegelonline number)
             }
             counters["accepted"] += 1
 
         self.logger.info(
             f"PARSE: accepted={counters['accepted']}, "
-            f"dwd_matched={counters['dwd_matched']}, "
-            f"dwd_canonical={counters['dwd_canonical']}, "
             f"skipped_no_uuid={counters['skipped_no_uuid']}, "
             f"skipped_bad_coords={counters['skipped_bad_coords']}"
         )
