@@ -27,7 +27,6 @@ from ingestlib.ingest import Ingest
 from ingestlib.core import make_lambda_handler
 from config import NAME
 from config.variables import variables
-from ingestlib import parse
 
 
 # ── Constants ──────────────────────────────────────────────────────
@@ -144,27 +143,10 @@ class GermanyWSVIngest(Ingest):
                     counters["bad_value"] += 1
                     continue
 
-                # unit conversion
                 var_def       = self.variables[ts_short]
                 vargem        = var_def["vargem"]
                 vnum          = int(var_def["VNUM"])
-                incoming_unit = parse.get_translated_value(
-                    ts_short, variables=self.variables, field="incoming_unit"
-                )
-                final_unit = var_def["final_unit"]
-
-                if incoming_unit and incoming_unit != final_unit:
-                    try:
-                        conversion_name = parse.create_conversion(
-                            incoming_unit, self.variables, ts_short
-                        )
-                        final_value = round(
-                            parse.convert_units(conversion_name, value), 3
-                        )
-                    except Exception:
-                        final_value = round(value, 3)
-                else:
-                    final_value = round(value, 3)
+                final_value = round(value, 3)
 
                 # insert
                 obs_time_str = dt_utc.strftime("%Y%m%d%H%M")
