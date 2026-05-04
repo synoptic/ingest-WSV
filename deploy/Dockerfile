@@ -16,7 +16,7 @@ RUN pip install --target ${FUNCTION_DIR} awslambdaric
 
 # Install private dependencies
 RUN --mount=type=ssh pip install git+ssh://git@github.com/synoptic/synoptic-logging.git@v1.0.5
-RUN --mount=type=ssh pip install "git+ssh://git@github.com/synoptic/ingestlib.git@sensor_sql_gen#egg=ingestlib"
+RUN --mount=type=ssh pip install --no-cache "git+ssh://git@github.com/synoptic/ingestlib.git@sensor_sql_gen#egg=ingestlib"
 
 # Install requirements
 COPY handlers/requirements.txt ${FUNCTION_DIR}

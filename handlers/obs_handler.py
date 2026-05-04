@@ -23,7 +23,7 @@ import requests
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
-from ingestlib.ingest import Ingest
+from ingestlib.ingest import Ingest, Observation
 from ingestlib.core import make_lambda_handler
 from config import NAME
 from config.variables import variables
@@ -36,7 +36,6 @@ PEGELONLINE_STATIONS_URL = (
     "?includeTimeseries=true"
     "&includeCurrentMeasurement=true"
 )
-
 
 # ── The ingest ─────────────────────────────────────────────────────
 
@@ -61,71 +60,39 @@ class GermanyWSVIngest(Ingest):
         return stations
 
     def parse(self, raw_stations: list) -> dict:
-        """
-        Transform raw Pegelonline data into grouped_obs_set.
-
-        For each station → timeseries → currentMeasurement, resolves the
-        SYNOPTIC_STID from station_meta. Stations not present in metadata
-        are skipped — the metadata lambda must run first to register them.
-
-        All registered stations are processed — DWD-matched stations are
-        not filtered.
-        """
-        # Build fast uuid → SYNOPTIC_STID lookup from metadata
-        uuid_to_stid: dict[str, str] = {
+        uuid_to_stid = {
             uuid: meta["SYNOPTIC_STID"]
             for uuid, meta in self.station_meta.items()
             if meta.get("SYNOPTIC_STID")
         }
 
         cutoff_dt = datetime.now(timezone.utc) - timedelta(hours=self.HOURS_TO_RETAIN)
-        counters  = defaultdict(int)
-
-        grouped_obs_set: dict[str, dict] = {}
+        counters = defaultdict(int)
+        observations = []
 
         for stn in raw_stations:
-            uuid      = stn.get("uuid")
+            uuid = stn.get("uuid")
             shortname = stn.get("shortname", "UNKNOWN")
 
-            # ── Resolve STID ───────────────────────────────────────
-            # If the station is not in metadata, skip it. The metadata
-            # lambda must run first to register the station.
             if uuid not in uuid_to_stid:
                 counters["skipped_not_in_meta"] += 1
-                self.logger.debug(
-                    f"PARSE: uuid={uuid} ({shortname}) not in station_meta; skipping"
-                )
                 continue
-
             stid = uuid_to_stid[uuid]
 
-            # ── Iterate timeseries ─────────────────────────────────
             for ts in stn.get("timeseries", []):
                 ts_short = ts.get("shortname", "")
-
                 if ts_short not in self.variables:
                     continue
 
-                current = ts.get("currentMeasurement")
-                if not current:
-                    continue
-
-                raw_ts  = current.get("timestamp")
-                raw_val = current.get("value")
-
+                current = ts.get("currentMeasurement") or {}
+                raw_ts, raw_val = current.get("timestamp"), current.get("value")
                 if raw_ts is None or raw_val is None:
                     counters["missing_value"] += 1
                     continue
 
-                # datetime
                 try:
-                    dt_local = datetime.fromisoformat(raw_ts)
-                    dt_utc   = dt_local.astimezone(timezone.utc)
-                except Exception as exc:
-                    self.logger.debug(
-                        f"PARSE: bad timestamp for {shortname}/{ts_short}: "
-                        f"{raw_ts!r} — {exc}"
-                    )
+                    dt_utc = datetime.fromisoformat(raw_ts).astimezone(timezone.utc)
+                except Exception:
                     counters["bad_datetime"] += 1
                     continue
 
@@ -133,40 +100,16 @@ class GermanyWSVIngest(Ingest):
                     counters["old_timestamp"] += 1
                     continue
 
-                # value
-                try:
-                    value = float(raw_val)
-                except (TypeError, ValueError):
-                    self.logger.debug(
-                        f"PARSE: non-numeric value for {shortname}/{ts_short}: {raw_val!r}"
-                    )
-                    counters["bad_value"] += 1
-                    continue
-
-                var_def       = self.variables[ts_short]
-                vargem        = var_def["vargem"]
-                vnum          = int(var_def["VNUM"])
-                final_value = round(value, 3)
-
-                # insert
-                obs_time_str = dt_utc.strftime("%Y%m%d%H%M")
-                key = f"{stid}|{obs_time_str}"
-                grouped_obs_set.setdefault(key, {}).setdefault(vargem, {})[vnum] = final_value
+                observations.append(Observation(
+                    stid=stid,
+                    dattim=dt_utc,
+                    incoming_var=ts_short,
+                    raw_value=raw_val,
+                ))
                 counters["accepted"] += 1
 
-        self.logger.info(
-            f"PARSE summary — "
-            f"accepted={counters['accepted']}, "
-            f"skipped_not_in_meta={counters['skipped_not_in_meta']}, "
-            f"old_timestamp={counters['old_timestamp']}, "
-            f"missing_value={counters['missing_value']}, "
-            f"bad_datetime={counters['bad_datetime']}, "
-            f"bad_value={counters['bad_value']}"
-        )
-        self.logger.debug(f"PARSE: {len(grouped_obs_set)} grouped observation records")
-
-        return grouped_obs_set
-
+        self.logger.info(f"PARSE summary — {dict(counters)}")
+        return observations
 
 # ── Entry points ───────────────────────────────────────────────────
 

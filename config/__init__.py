@@ -8,7 +8,7 @@
 
 # ── Ingest identity ────────────────────────────────────────
 NAME            = "germanyWSV"
-DISPLAY_NAME    = "Germany WSV"                  # for stack names, descriptions
+DISPLAY_NAME    = "GermanyWSV"                  # for stack names, descriptions
 MNET_ID         = 343
 STID_PREFIX     = "WSV"
 INCOMING_ELEVATION_UNIT = "METERS"
@@ -35,7 +35,7 @@ MNET_CATEGORY  = 14              # 14 = surface synoptic / land-based met networ
 
 # ── AWS account & networking ──────────────────────────────
 ACCOUNT    = "905418025696"
-REGION     = "us-east-1"
+REGION     = "us-west-2"
 VPC_ID     = "vpc-09a07e46ba606169b"
 SUBNET_IDS = [
     "subnet-07287ffd7252971f0",
